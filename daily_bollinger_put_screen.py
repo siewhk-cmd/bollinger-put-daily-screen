@@ -5,7 +5,7 @@ Daily Bollinger put-selling screener.
 Rule:
   Current Strategy 1/2 signal
   + Historically Effective for that exact strategy
-  + SPY regime is Bullish or Sideways/Transitional
+  + SPY regime is Bullish ONLY
   = Qualified candidate
 
 Price data: Massive REST aggregates.
@@ -39,6 +39,9 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import requests
+
+# Reuse HTTP connections across Massive API calls for lower connection overhead.
+HTTP_SESSION = requests.Session()
 
 # -----------------------------------------------------------------------------
 # HARD-CODED UNIVERSE: copied from S&P500nETF.txt exactly as requested.
@@ -87,7 +90,7 @@ def request_json(url: str, params: dict, cfg: Config) -> dict:
     last_err = None
     for attempt in range(cfg.max_retries):
         try:
-            r = requests.get(url, params=params, timeout=cfg.request_timeout)
+            r = HTTP_SESSION.get(url, params=params, timeout=cfg.request_timeout)
             if r.status_code == 429:
                 wait = min(60, 2 ** attempt)
                 retry_after = r.headers.get("Retry-After")
@@ -629,64 +632,153 @@ def main() -> int:
     else:
         from zoneinfo import ZoneInfo
         asof = datetime.now(ZoneInfo("Asia/Singapore")).date()
+
     outdir = Path(args.output_root) / asof.isoformat()
     chart_dir = outdir / "charts"
     outdir.mkdir(parents=True, exist_ok=True)
+
+    # -------------------------------------------------------------------------
+    # STAGE 1 — SPY FIRST / FAIL FAST
+    # No stock effectiveness file and no individual stock data are loaded until
+    # SPY has been confirmed Bullish.
+    # -------------------------------------------------------------------------
+    print("Loading SPY for market regime...")
+    try:
+        spy_raw = fetch_massive_daily("SPY", api_key, cfg, asof)
+        spy = compute_indicators(spy_raw, cfg)
+        regime, spy_close, spy_ma200, spy_slope = spy_regime(spy)
+    except Exception as e:
+        print(f"ERROR loading SPY: {type(e).__name__}: {e}", file=sys.stderr)
+        return 2
+
+    latest_market_date = pd.Timestamp(spy.iloc[-1]["Date"])
+    data_fresh = (asof - latest_market_date.date()).days <= 4
+
+    print(
+        f"SPY {latest_market_date.date()} close={spy_close:.2f} "
+        f"MA200={spy_ma200:.2f} slope20={spy_slope:.4%} regime={regime}"
+    )
+    print(f"The SPY regime is {regime}.")
+
+    # Bullish ONLY. Bearish, Sideways/Transitional and Unknown all stop here.
+    if regime != "Bullish":
+        print("The SPY is not bullish. Stock screening stopped.")
+
+        # Keep lightweight run records without doing any stock work.
+        summary_lines = [
+            f"Bollinger Put Screen — {latest_market_date.date()}",
+            "",
+            "MARKET ENVIRONMENT",
+            f"SPY Close: {spy_close:.2f}",
+            f"SPY 200DMA: {spy_ma200:.2f}" if np.isfinite(spy_ma200) else "SPY 200DMA: N/A",
+            f"SPY 200DMA 20-day slope: {spy_slope:.2%}" if np.isfinite(spy_slope) else "SPY 200DMA 20-day slope: N/A",
+            f"SPY regime: {regime}",
+            f"Latest market-data date: {latest_market_date.date()}",
+            f"Data fresh: {'YES' if data_fresh else 'NO — WARNING: MARKET DATA MAY BE STALE'}",
+            "Trading filter allowed: NO — SPY must be Bullish",
+            "",
+            f"The SPY regime is {regime}.",
+            "The SPY is not bullish. Stock screening stopped.",
+        ]
+        summary_text = "\n".join(summary_lines)
+        (outdir / "daily_summary.txt").write_text(summary_text, encoding="utf-8")
+        metadata = {
+            "run_time": datetime.now().isoformat(timespec="seconds"),
+            "latest_market_date": str(latest_market_date.date()),
+            "spy_regime": regime,
+            "screening_stopped_early": True,
+            "reason": "SPY_not_bullish",
+            "qualified_candidates": 0,
+            "strategy1_signals": 0,
+            "strategy2_signals": 0,
+            "errors": 0,
+        }
+        (outdir / "run_metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+        return 0
+
+    print("SPY is Bullish. Proceeding to historically Effective stocks only...")
+
+    # -------------------------------------------------------------------------
+    # STAGE 2 — LOAD HISTORICAL EFFECTIVENESS ONLY AFTER SPY PASSES
+    # -------------------------------------------------------------------------
     eff = load_effectiveness(Path(args.effectiveness_file))
+
+    effective_by_ticker: Dict[str, set] = {}
+    for (ticker, strategy), hist in eff.items():
+        if ticker not in STOCKS:
+            continue
+        if strategy not in {"Strategy1", "Strategy2"}:
+            continue
+        if hist.get("classification") == "Effective":
+            effective_by_ticker.setdefault(ticker, set()).add(strategy)
+
+    # Preserve the order of the existing hard-coded universe.
+    tickers = [
+        (ticker, company)
+        for ticker, company in STOCKS.items()
+        if ticker in effective_by_ticker
+    ]
+
+    if args.max_tickers > 0:
+        tickers = tickers[:args.max_tickers]
+
+    total = len(tickers)
+    effective_pairs = sum(len(v) for v in effective_by_ticker.values())
+    print(
+        f"Historical filter: {len(effective_by_ticker)} Effective tickers / "
+        f"{effective_pairs} Effective ticker-strategy pairs."
+    )
+    print(f"Tickers to download/process this run: {total}")
 
     errors, rejected, candidates = [], [], []
     strategy_signal_counts = {"Strategy1": 0, "Strategy2": 0}
 
-    # SPY first: its latest bar defines the data date and market regime.
-    print("Loading SPY for market regime...")
-    spy_raw = fetch_massive_daily("SPY", api_key, cfg, asof)
-    spy = compute_indicators(spy_raw, cfg)
-    regime, spy_close, spy_ma200, spy_slope = spy_regime(spy)
-    latest_market_date = pd.Timestamp(spy.iloc[-1]["Date"])
-    data_fresh = (asof - latest_market_date.date()).days <= 4
-    print(f"SPY {latest_market_date.date()} close={spy_close:.2f} MA200={spy_ma200:.2f} slope20={spy_slope:.4%} regime={regime}")
-
-    tickers = list(STOCKS.items())
-    if args.max_tickers > 0:
-        # Ensure SPY stays included for a test run.
-        tickers = tickers[:args.max_tickers]
-    total = len(tickers)
-
+    # -------------------------------------------------------------------------
+    # STAGE 3 — PROCESS ONLY EFFECTIVE TICKERS AND ONLY THEIR EFFECTIVE STRATEGIES
+    # -------------------------------------------------------------------------
     for idx, (ticker, company) in enumerate(tickers, 1):
         try:
+            active_strategies = effective_by_ticker[ticker]
+
+            # Reuse the SPY data already downloaded if SPY itself is Effective.
             if ticker == "SPY":
                 d = spy.copy()
             else:
-                d = compute_indicators(fetch_massive_daily(ticker, api_key, cfg, asof), cfg)
+                d = compute_indicators(
+                    fetch_massive_daily(ticker, api_key, cfg, asof), cfg
+                )
+
             latest = d.iloc[-1]
             data_date = pd.Timestamp(latest["Date"])
             if data_date.normalize() != latest_market_date.normalize():
-                rejected.append({"date": data_date.date(), "ticker": ticker, "company": company, "strategy": "N/A", "reason": f"stale_vs_SPY_{latest_market_date.date()}"})
-                print(f"[{idx}/{total}] {ticker}: stale {data_date.date()} (SPY {latest_market_date.date()})")
+                rejected.append({
+                    "date": data_date.date(),
+                    "ticker": ticker,
+                    "company": company,
+                    "strategy": ",".join(sorted(active_strategies)),
+                    "reason": f"stale_vs_SPY_{latest_market_date.date()}",
+                })
+                print(
+                    f"[{idx}/{total}] {ticker}: stale {data_date.date()} "
+                    f"(SPY {latest_market_date.date()})"
+                )
                 continue
 
-            s1 = current_signal(detect_strategy1(d, cfg), data_date)
-            s2 = current_signal(detect_strategy2(d, cfg), data_date)
-            for strategy, sig in [("Strategy1", s1), ("Strategy2", s2)]:
-                if sig is None:
+            # Run ONLY strategies historically classified as Effective.
+            s1 = None
+            s2 = None
+            if "Strategy1" in active_strategies:
+                s1 = current_signal(detect_strategy1(d, cfg), data_date)
+            if "Strategy2" in active_strategies:
+                s2 = current_signal(detect_strategy2(d, cfg), data_date)
+
+            for strategy, sig in (("Strategy1", s1), ("Strategy2", s2)):
+                if strategy not in active_strategies or sig is None:
                     continue
+
                 strategy_signal_counts[strategy] += 1
-                hist = eff.get((ticker, strategy), {
-                    "classification": "Insufficient Data", "oos_signal_count": 0,
-                    "oos_touch_pct": np.nan, "oos_breach_pct": np.nan,
-                    "oos_terminal_itm_pct": np.nan, "oos_median_forward_return": np.nan,
-                    "selected_method": ""
-                })
-                classification = hist["classification"]
-                if classification != "Effective":
-                    rejected.append({"date": data_date.date(), "ticker": ticker, "company": company, "strategy": strategy, "classification": classification, "reason": f"historical_classification_{classification}"})
-                    continue
-                if regime == "Bearish":
-                    rejected.append({"date": data_date.date(), "ticker": ticker, "company": company, "strategy": strategy, "classification": classification, "reason": "SPY_Bearish"})
-                    continue
-                if regime == "Unknown":
-                    rejected.append({"date": data_date.date(), "ticker": ticker, "company": company, "strategy": strategy, "classification": classification, "reason": "SPY_regime_unknown"})
-                    continue
+                hist = eff[(ticker, strategy)]
+                classification = hist["classification"]  # Effective by construction
 
                 signal_idx = int(sig["signal_idx"])
                 signal_row = d.iloc[signal_idx]
@@ -694,19 +786,31 @@ def main() -> int:
                 atr = float(signal_row["ATR"])
                 method = hist.get("selected_method", "")
                 strike = strike_from_method(method, signal_close, atr, sig)
+
                 if not np.isfinite(strike) or strike <= 0:
-                    rejected.append({"date": data_date.date(), "ticker": ticker, "company": company, "strategy": strategy, "classification": classification, "reason": f"cannot_compute_strike_method_{method}"})
+                    rejected.append({
+                        "date": data_date.date(),
+                        "ticker": ticker,
+                        "company": company,
+                        "strategy": strategy,
+                        "classification": classification,
+                        "reason": f"cannot_compute_strike_method_{method}",
+                    })
                     continue
 
+                # Earnings is deliberately deferred until every cheap filter passes.
                 earnings = get_next_earnings(ticker, api_key, cfg, data_date.date())
                 earn_date = earnings.get("date")
                 earn_days = earnings.get("days")
-                earn_warn = (earn_days is not None and earn_days <= 30)
+                earn_warn = earn_days is not None and earn_days <= 30
 
                 row = {
-                    "date": data_date.date(), "ticker": ticker, "company": company,
+                    "date": data_date.date(),
+                    "ticker": ticker,
+                    "company": company,
                     "asset_type": "ETF" if ticker in ETFS else "Stock",
-                    "strategy": strategy, "classification": classification,
+                    "strategy": strategy,
+                    "classification": classification,
                     "signal_date": pd.Timestamp(sig["signal_date"]).date(),
                     "signal_close": signal_close,
                     "entry_status": "Next Trading Day Open",
@@ -716,11 +820,14 @@ def main() -> int:
                     "proposed_strike": float(strike),
                     "atr14_dollars": atr,
                     "atr14_pct": float(signal_row["ATR_Pct"]) if pd.notna(signal_row["ATR_Pct"]) else np.nan,
-                    "bb_upper": float(signal_row["BB_Upper"]), "bb_mid": float(signal_row["BB_Mid"]), "bb_lower": float(signal_row["BB_Lower"]),
+                    "bb_upper": float(signal_row["BB_Upper"]),
+                    "bb_mid": float(signal_row["BB_Mid"]),
+                    "bb_lower": float(signal_row["BB_Lower"]),
                     "squeeze_percentile": sig.get("squeeze_percentile", np.nan),
                     "expansion_growth_1d": sig.get("expansion_growth_1d", np.nan),
                     "rsi14": float(signal_row["RSI"]) if pd.notna(signal_row["RSI"]) else np.nan,
-                    "above_50dma": bool(signal_row["Above_50DMA"]), "above_200dma": bool(signal_row["Above_200DMA"]),
+                    "above_50dma": bool(signal_row["Above_50DMA"]),
+                    "above_200dma": bool(signal_row["Above_200DMA"]),
                     "historical_oos_signals": hist.get("oos_signal_count", 0),
                     "historical_oos_touch_pct": hist.get("oos_touch_pct", np.nan),
                     "historical_oos_breach_pct": hist.get("oos_breach_pct", np.nan),
@@ -728,25 +835,46 @@ def main() -> int:
                     "historical_oos_median_forward_return": hist.get("oos_median_forward_return", np.nan),
                     "historical_touch_pct_text": pct(hist.get("oos_touch_pct", np.nan)),
                     "historical_terminal_itm_pct_text": pct(hist.get("oos_terminal_itm_pct", np.nan)),
-                    "spy_regime": regime, "spy_close": spy_close, "spy_ma200": spy_ma200, "spy_ma200_slope20": spy_slope,
+                    "spy_regime": regime,
+                    "spy_close": spy_close,
+                    "spy_ma200": spy_ma200,
+                    "spy_ma200_slope20": spy_slope,
                     "next_earnings_date": str(earn_date) if earn_date else ("N/A — ETF" if ticker in ETFS else "Unknown"),
                     "days_until_earnings": earn_days,
                     "earnings_within_30_days": earn_warn if earn_days is not None else None,
-                    "earnings_date_status": earnings.get("status"), "earnings_source": earnings.get("source"),
+                    "earnings_date_status": earnings.get("status"),
+                    "earnings_source": earnings.get("source"),
                     "candidate_status": "QUALIFIED",
                 }
                 candidates.append(row)
+
+                # Charts are also candidate-only.
                 chart_path = chart_dir / f"{ticker}_{strategy}.png"
-                make_candidate_chart(d, ticker, company, sig, strike, hist, regime, earnings, chart_path)
+                make_candidate_chart(
+                    d, ticker, company, sig, strike, hist, regime, earnings, chart_path
+                )
                 row["chart_path"] = str(chart_path)
-                print(f">>> QUALIFIED: {ticker} | {strategy} | Effective | {regime} | Strike={strike:.2f}")
+                print(
+                    f">>> QUALIFIED: {ticker} | {strategy} | Effective | "
+                    f"{regime} | Strike={strike:.2f}"
+                )
 
             if idx == 1 or idx % 25 == 0 or idx == total:
-                print(f"[{idx}/{total}] {ticker} | S1={bool(s1)} | S2={bool(s2)}")
+                active_text = "/".join(sorted(active_strategies))
+                print(
+                    f"[{idx}/{total}] {ticker} | Effective={active_text} | "
+                    f"S1={bool(s1)} | S2={bool(s2)}"
+                )
+
         except Exception as e:
             errors.append({
-                "ticker": ticker, "stage": "daily_screen", "error_type": type(e).__name__,
-                "error": str(e), "traceback_tail": " | ".join(traceback.format_exc().strip().splitlines()[-3:])
+                "ticker": ticker,
+                "stage": "daily_screen",
+                "error_type": type(e).__name__,
+                "error": str(e),
+                "traceback_tail": " | ".join(
+                    traceback.format_exc().strip().splitlines()[-3:]
+                ),
             })
             print(f"WARNING {ticker}: {type(e).__name__}: {e}")
 
@@ -767,23 +895,28 @@ def main() -> int:
         f"SPY regime: {regime}",
         f"Latest market-data date: {latest_market_date.date()}",
         f"Data fresh: {'YES' if data_fresh else 'NO — WARNING: MARKET DATA MAY BE STALE'}",
-        f"Trading filter allowed: {'YES' if regime in {'Bullish','Sideways/Transitional'} else 'NO'}",
+        "Trading filter allowed: YES — SPY is Bullish",
         "",
-        f"Current Strategy 1 signals: {strategy_signal_counts['Strategy1']}",
-        f"Current Strategy 2 signals: {strategy_signal_counts['Strategy2']}",
+        f"Historically Effective tickers: {len(effective_by_ticker)}",
+        f"Tickers processed this run: {total}",
+        f"Effective Strategy 1 current signals: {strategy_signal_counts['Strategy1']}",
+        f"Effective Strategy 2 current signals: {strategy_signal_counts['Strategy2']}",
         f"Qualified candidates: {len(candidates)}",
         f"Errors: {len(errors)}",
     ]
+
     if candidates:
         summary_lines += ["", "QUALIFIED CANDIDATES"]
         for r in candidates:
             earn_flag = " ⚠ EARNINGS <30D" if r.get("earnings_within_30_days") is True else ""
             summary_lines += [
-                f"{r['ticker']} | {r['strategy']} | Effective | Strike {r['proposed_strike']:.2f} | "
-                f"Hist ITM {r['historical_terminal_itm_pct_text']} | Earnings {r['next_earnings_date']}{earn_flag}"
+                f"{r['ticker']} | {r['strategy']} | Effective | "
+                f"Strike {r['proposed_strike']:.2f} | "
+                f"Hist ITM {r['historical_terminal_itm_pct_text']} | "
+                f"Earnings {r['next_earnings_date']}{earn_flag}"
             ]
     else:
-        summary_lines += ["", "No stocks or ETFs fit the criteria today."]
+        summary_lines += ["", "No Effective stocks or ETFs generated a qualifying signal today."]
 
     summary_text = "\n".join(summary_lines)
     summary_path = outdir / "daily_summary.txt"
@@ -798,18 +931,22 @@ def main() -> int:
                 if cp.exists():
                     telegram_send_photo(tg_token, tg_chat, cp, candidate_caption(r))
             telegram_send_document(tg_token, tg_chat, cand_csv, "Qualified candidate CSV")
-        # Explicit no-candidate delivery is already in summary_text.
 
     metadata = {
         "run_time": datetime.now().isoformat(timespec="seconds"),
         "latest_market_date": str(latest_market_date.date()),
         "spy_regime": regime,
+        "screening_stopped_early": False,
+        "historically_effective_tickers": len(effective_by_ticker),
+        "tickers_processed": total,
         "qualified_candidates": len(candidates),
         "strategy1_signals": strategy_signal_counts["Strategy1"],
         "strategy2_signals": strategy_signal_counts["Strategy2"],
         "errors": len(errors),
     }
-    (outdir / "run_metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+    (outdir / "run_metadata.json").write_text(
+        json.dumps(metadata, indent=2), encoding="utf-8"
+    )
     return 0
 
 

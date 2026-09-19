@@ -1,0 +1,44 @@
+name: Daily Bollinger Put Screen
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Tuesday-Saturday morning in Singapore = after Monday-Friday U.S. market close.
+    - cron: '30 7 * * 2-6'
+      timezone: 'Asia/Singapore'
+
+permissions:
+  contents: read
+
+jobs:
+  screen:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run daily screener
+        env:
+          MASSIVE_API_KEY: ${{ secrets.MASSIVE_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python daily_bollinger_put_screen.py
+
+      - name: Upload daily outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bollinger-put-screen-${{ github.run_id }}
+          path: output/
+          if-no-files-found: ignore
+          retention-days: 30
